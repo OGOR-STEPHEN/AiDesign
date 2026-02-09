@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef, useState } from 'react';
-import html2canvas from 'html2canvas';
+import { toPng } from 'html-to-image';
 import { Download, Loader2 } from 'lucide-react';
 
 type TemplateProps = {
@@ -30,6 +30,34 @@ export default function CanvasTemplate({
   const templateRef = useRef<HTMLDivElement>(null);
   const [isDownloading, setIsDownloading] = useState(false);
 
+  // Function to get a CORS-friendly URL via our local proxy
+  const getProxyUrl = (url: string) => {
+    if (!url || url.startsWith('data:')) return url;
+    return `/api/proxy?url=${encodeURIComponent(url)}`;
+  };
+
+  const handleDownloadRaw = async () => {
+    setIsDownloading(true);
+    try {
+      const proxyUrl = getProxyUrl(imageUrl);
+      const response = await fetch(proxyUrl);
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `ai-background-${Date.now()}.jpg`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error("Raw download failed", e);
+      alert("Failed to download pure image. Please try opening it directly.");
+    } finally {
+      setIsDownloading(false);
+    }
+  };
+
   const handleDownload = async () => {
     if (!templateRef.current) {
       alert('Template not ready. Please try again.');
@@ -38,73 +66,20 @@ export default function CanvasTemplate({
 
     setIsDownloading(true);
     try {
-      console.log('Starting download...');
+      console.log('Starting high-quality capture...');
 
-      // Clone and sanitize styles to avoid unsupported color functions (lab/oklab/etc)
-      const element = templateRef.current.cloneNode(true) as HTMLElement;
-      document.body.appendChild(element);
-      element.style.position = 'fixed';
-      element.style.left = '-9999px';
-      element.style.top = '-9999px';
+      // Give images a moment to be absolutely sure they are painted
+      await new Promise(resolve => setTimeout(resolve, 500));
 
-      const sanitizeColors = (el: HTMLElement) => {
-        const style = window.getComputedStyle(el);
-        const props = [
-          'backgroundColor',
-          'color',
-          'borderColor',
-          'outlineColor',
-          'textDecorationColor',
-          'boxShadow',
-          'backgroundImage'
-        ];
+      const dataUrl = await toPng(templateRef.current, {
+        cacheBust: true,
+        pixelRatio: 2,
+        backgroundColor: template.backgroundColor,
+        quality: 1,
+        // Ensure we wait for foreign objects
+        skipFonts: false,
+      });
 
-        const needsFix = (val: string) =>
-          val.includes('lab(') ||
-          val.includes('lch(') ||
-          val.includes('oklab') ||
-          val.includes('oklch') ||
-          val.includes('color-mix');
-
-        props.forEach((prop) => {
-          const val = style[prop as keyof CSSStyleDeclaration];
-          if (typeof val === 'string' && needsFix(val)) {
-            if (prop === 'color') {
-              el.style.color = template.textColor;
-            } else if (prop === 'backgroundColor' || prop === 'backgroundImage') {
-              el.style.backgroundColor = template.backgroundColor;
-              el.style.backgroundImage = 'none';
-            } else if (prop.includes('Color')) {
-              el.style.borderColor = 'transparent';
-              if (prop === 'outlineColor') el.style.outlineColor = 'transparent';
-              if (prop === 'textDecorationColor') el.style.textDecorationColor = 'transparent';
-            } else if (prop === 'boxShadow') {
-              el.style.boxShadow = 'none';
-            }
-          }
-        });
-
-        Array.from(el.children).forEach((child) => sanitizeColors(child as HTMLElement));
-      };
-
-      let canvas: HTMLCanvasElement;
-      try {
-        sanitizeColors(element);
-
-        // html2canvas is often more reliable with external images and CORS
-        canvas = await html2canvas(element, {
-          useCORS: true,
-          allowTaint: false,
-          backgroundColor: template.backgroundColor,
-          scale: 2,
-          logging: false,
-          removeContainer: true
-        });
-      } finally {
-        if (element.parentElement) element.parentElement.removeChild(element);
-      }
-
-      const dataUrl = canvas.toDataURL('image/png', 1.0);
       const link = document.createElement('a');
       link.download = `canva-design-${Date.now()}.png`;
       link.href = dataUrl;
@@ -113,8 +88,18 @@ export default function CanvasTemplate({
       console.log('Download successful');
     } catch (error) {
       console.error('Download failed:', error);
-      const errorMessage = error instanceof Error ? error.message : 'Detailed error in console';
-      alert(`Download failed.\n\nPossible cause: CORS restrictions on the background image.\n\nError: ${errorMessage}`);
+      alert('Download failed. Attempting fallback capture...');
+
+      // Secondary fallback if toPng fails
+      try {
+        const dataUrl = await toPng(templateRef.current);
+        const link = document.createElement('a');
+        link.download = `design-fallback.png`;
+        link.href = dataUrl;
+        link.click();
+      } catch (e) {
+        alert('All capture methods failed. Please try a different browser.');
+      }
     } finally {
       setIsDownloading(false);
     }
@@ -132,12 +117,15 @@ export default function CanvasTemplate({
           {/* Background Image */}
           <div className="absolute inset-0">
             <img
-              src={imageUrl}
+              src={getProxyUrl(imageUrl)}
               alt="Generated background"
               className="w-full h-full object-cover opacity-40"
               crossOrigin="anonymous"
             />
             <div className="absolute inset-0 bg-gradient-to-br from-black/30 to-transparent" />
+            <div className="absolute top-2 right-2 bg-purple-600/60 backdrop-blur-md text-[10px] text-white px-2 py-0.5 rounded font-bold uppercase tracking-widest border border-purple-400/30">
+              AI Image
+            </div>
           </div>
 
           {/* Content - Responsive */}
@@ -199,25 +187,37 @@ export default function CanvasTemplate({
         </div>
       </div>
 
-      {/* Download Button - Responsive */}
-      <button
-        onClick={handleDownload}
-        disabled={isDownloading}
-        className={`flex items-center justify-center gap-2 mx-auto px-4 py-2 md:px-6 md:py-3 bg-gradient-to-r from-purple-600 to-blue-600 text-white rounded-lg font-semibold transition-opacity shadow-lg text-sm md:text-base ${isDownloading ? 'opacity-50 cursor-not-allowed' : 'hover:opacity-90'
-          }`}
-      >
-        {isDownloading ? (
-          <>
-            <Loader2 className="w-4 h-4 md:w-5 md:h-5 animate-spin" />
-            Downloading...
-          </>
-        ) : (
-          <>
-            <Download className="w-4 h-4 md:w-5 md:h-5" />
-            Download Design (1200×630)
-          </>
-        )}
-      </button>
+      {/* Download Buttons - Responsive Stack */}
+      <div className="flex flex-col sm:flex-row gap-3 md:gap-4 max-w-md mx-auto">
+        <button
+          onClick={handleDownload}
+          disabled={isDownloading}
+          className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 md:px-6 md:py-3 bg-gradient-to-r from-purple-600 to-blue-600 text-white rounded-lg font-semibold transition-opacity shadow-lg text-sm md:text-base ${isDownloading ? 'opacity-50 cursor-not-allowed' : 'hover:opacity-90'
+            }`}
+        >
+          {isDownloading ? (
+            <>
+              <Loader2 className="w-4 h-4 md:w-5 md:h-5 animate-spin" />
+              Processing...
+            </>
+          ) : (
+            <>
+              <Download className="w-4 h-4 md:w-5 md:h-5" />
+              Full Design (PNG)
+            </>
+          )}
+        </button>
+
+        <button
+          onClick={handleDownloadRaw}
+          disabled={isDownloading}
+          className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 md:px-6 md:py-3 bg-gray-800 text-gray-200 border border-gray-700 rounded-lg font-semibold transition-opacity hover:bg-gray-700 text-sm md:text-base ${isDownloading ? 'opacity-50 cursor-not-allowed' : ''
+            }`}
+        >
+          <img src={getProxyUrl(imageUrl)} className="w-5 h-5 rounded object-cover border border-white/20" alt="pure" />
+          Pure Image (JPG)
+        </button>
+      </div>
 
       {/* Size Indicator */}
       <div className="text-center text-gray-500 text-xs md:text-sm">

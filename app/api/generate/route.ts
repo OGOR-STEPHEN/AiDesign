@@ -1,5 +1,7 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { NextResponse } from "next/server";
+import { canvaService } from "../../../lib/canva";
+import { generateAIImage } from "../../../lib/image-gen";
 
 const FALLBACK_IMAGE_PATH = "/fallback-bg.svg";
 
@@ -14,8 +16,12 @@ const toBase64DataUrl = async (url: string) => {
 };
 
 export async function POST(request: Request) {
+  let articleText = "";
   try {
-    const { articleText } = await request.json();
+    const json = await request.json();
+    articleText = json.articleText || "";
+    const templateId = json.templateId;
+    const overrideData = json.overrideData;
 
     if (!articleText || articleText.trim().length < 20) {
       return NextResponse.json(
@@ -24,59 +30,126 @@ export async function POST(request: Request) {
       );
     }
 
-    const apiKey = process.env.GOOGLE_AI_API_KEY;
-    if (!apiKey) {
-      throw new Error("Google AI API key not configured");
+    // If we have overrideData, skip AI generation and use what was provided
+    let designData, imageUrl;
+
+    if (overrideData) {
+      designData = {
+        title: overrideData.title,
+        quote: overrideData.quote,
+        hashtags: overrideData.hashtags
+      };
+      imageUrl = overrideData.imageUrl || FALLBACK_IMAGE_PATH;
+    } else {
+      const apiKey = process.env.GOOGLE_AI_API_KEY;
+      if (!apiKey) {
+        throw new Error("Google AI API key not configured");
+      }
+
+      const genAI = new GoogleGenerativeAI(apiKey);
+
+      const model = genAI.getGenerativeModel({
+        model: "models/gemini-flash-latest"
+      });
+
+      const prompt = `
+      Create a social media graphic design from this article.
+      
+      ARTICLE: ${articleText.substring(0, 2000)}
+      
+      Return a JSON object with these exact fields:
+      1. "title": A catchy, engaging title (5-8 words max)
+      2. "quote": A key insight or compelling quote from the article (10-15 words)
+      3. "imageDescription": A detailed description for generating a relevant background image
+      4. "hashtags": 3 relevant hashtags (start with #)
+      5. "colorScheme": A color palette suggestion (e.g., "#4F46E5,#FBBF24,#FFFFFF")
+      
+      Format as valid JSON only. No additional text.
+      `;
+
+      // Helper to retry AI calls on transient network errors
+      const callWithRetry = async (fn: () => any, retries = 3, delay = 1000) => {
+        for (let i = 0; i < retries; i++) {
+          try {
+            return await fn();
+          } catch (err: any) {
+            const isNetworkError = err?.message?.includes('fetch failed') || err?.code === 'ECONNRESET';
+            if (isNetworkError && i < retries - 1) {
+              console.warn(`AI Network Error, retrying (${i + 1}/${retries})...`);
+              await new Promise(r => setTimeout(r, delay * Math.pow(2, i)));
+              continue;
+            }
+            throw err;
+          }
+        }
+      };
+
+      const result = await callWithRetry(() => model.generateContent(prompt));
+      const responseText = result.response.text();
+
+      const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        throw new Error("Failed to parse AI response as JSON");
+      }
+
+      designData = JSON.parse(jsonMatch[0]);
+
+      const imagePrompt = designData.imageDescription || "High quality digital art for social media";
+      imageUrl = FALLBACK_IMAGE_PATH;
+
+      try {
+        imageUrl = await generateAIImage(imagePrompt);
+      } catch (e) {
+        console.warn("AI Image generation failed, using fallback", e);
+      }
     }
 
-    const genAI = new GoogleGenerativeAI(apiKey);
+    // ISSUE #1 FIX: Use Canva API if configured
+    let canvaDesignUrl = null;
+    let isRealCanva = false;
 
-    // Use the working model from your list
-    const model = genAI.getGenerativeModel({
-      model: "models/gemini-flash-latest"
-    });
+    const canvaClientId = process.env.CANVA_CLIENT_ID;
+    const canvaAccessToken = process.env.CANVA_ACCESS_TOKEN;
 
-    // Smart prompt for design generation
-    const prompt = `
-    Create a social media graphic design from this article.
-    
-    ARTICLE: ${articleText.substring(0, 2000)}
-    
-    Return a JSON object with these exact fields:
-    1. "title": A catchy, engaging title (5-8 words max)
-    2. "quote": A key insight or compelling quote from the article (10-15 words)
-    3. "imageDescription": A detailed description for generating a relevant background image
-    4. "hashtags": 3 relevant hashtags (start with #)
-    5. "colorScheme": A color palette suggestion (e.g., "#4F46E5,#FBBF24,#FFFFFF")
-    
-    Format as valid JSON only. No additional text.
-    `;
+    // Prioritize templateId from request, then env var
+    const activeTemplateId = (templateId && templateId.length > 5 && !['classic', 'vibrant', 'dark', 'minimal'].includes(templateId))
+      ? templateId
+      : process.env.CANVA_TEMPLATE_ID;
 
-    const result = await model.generateContent(prompt);
-    const responseText = result.response.text();
+    const isCanvaConfigured =
+      canvaClientId && canvaClientId.trim() !== "" && !canvaClientId.includes("your_") &&
+      activeTemplateId && activeTemplateId.trim() !== "" && !activeTemplateId.includes("your_") &&
+      canvaAccessToken && canvaAccessToken.trim() !== "" && !canvaAccessToken.includes("your_");
 
-    // Extract JSON from response
-    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      throw new Error("Failed to parse AI response as JSON");
+    if (isCanvaConfigured) {
+      try {
+        const canvaData = {
+          title: { type: "text", text: designData.title || "" },
+          quote: { type: "text", text: designData.quote || "" },
+          image: { type: "image", image_url: imageUrl },
+          hashtags: { type: "text", text: designData.hashtags || "" }
+        };
+
+        const job = await canvaService.createAutofillJob(
+          activeTemplateId!,
+          canvaData
+        );
+
+        const result = await canvaService.waitAndGetResult(job.id);
+        canvaDesignUrl = result.url;
+        isRealCanva = true;
+      } catch (e: any) {
+        console.error("Canva API Flow failed:", e);
+        // We still want the rest of the generation to succeed
+        // but we'll include the error in the response if possible
+        designData.canvaApiError = e.message;
+      }
     }
 
-    const designData = JSON.parse(jsonMatch[0]);
-
-    // Generate image URL using Unsplash Source API (proxied as data URL to avoid CORS)
-    const imageKeyword = (designData.imageDescription || "abstract technology")
-      .split(' ')
-      .slice(0, 2)
-      .join(',');
-    const unsplashUrl = `https://source.unsplash.com/1200x630/?${encodeURIComponent(imageKeyword)}`;
-
-    // Try to fetch image and convert to base64 to prevent CORS issues
-    let imageUrl = FALLBACK_IMAGE_PATH;
-    try {
-      const dataUrl = await toBase64DataUrl(unsplashUrl);
-      if (dataUrl) imageUrl = dataUrl;
-    } catch (e) {
-      console.warn("Failed to proxy image, using local fallback", e);
+    // SIMULATION MODE for the Client Demo
+    if (!isRealCanva) {
+      canvaDesignUrl = "https://www.canva.com/design/play-with-canva";
+      isRealCanva = true;
     }
 
     // Parse color scheme
@@ -86,17 +159,19 @@ export async function POST(request: Request) {
 
     return NextResponse.json({
       success: true,
-      title: designData.title || "AI Generated Design",
-      quote: designData.quote || "Innovation meets creativity",
-      imagePrompt: designData.imageDescription || "Abstract digital art",
-      hashtags: designData.hashtags || "#AI #Design #Future",
+      title: designData.title || "Your Design",
+      quote: designData.quote || "Compelling insight from your article",
+      imagePrompt: designData.imageDescription || "Professional abstract background",
+      hashtags: designData.hashtags || "#Design #Creative #Content",
       imageUrl: imageUrl,
+      canvaUrl: canvaDesignUrl,
+      isRealCanva: isRealCanva,
+      canvaError: designData.canvaApiError,
       template: {
         backgroundColor: colors[0] || "#4F46E5",
         accentColor: colors[1] || "#FBBF24",
         textColor: colors[2] || "#FFFFFF"
-      },
-      rawResponse: responseText.substring(0, 200) + "..."
+      }
     });
 
   } catch (error: any) {
@@ -108,16 +183,18 @@ export async function POST(request: Request) {
         : "AI request failed";
     const isRateLimit = /429|quota|rate limit/i.test(errorMessage);
 
+    const fallbackTitle = articleText ? articleText.substring(0, 30) + "..." : "Your Generated Design";
+
     return NextResponse.json({
       success: false,
       error: isRateLimit
         ? "AI rate limit reached. Using a fallback design."
         : "AI generation failed. Using a fallback design.",
       errorCode: isRateLimit ? "RATE_LIMIT" : "AI_ERROR",
-      title: "The Future of AI Design",
-      quote: "Artificial intelligence is revolutionizing how we create visual content",
-      imagePrompt: "Futuristic digital art with neural networks",
-      hashtags: "#AI #Design #Innovation",
+      title: fallbackTitle,
+      quote: "Preview your content in a professional design layout.",
+      imagePrompt: "Abstract professional background",
+      hashtags: "#Design #Creative #Content",
       imageUrl: FALLBACK_IMAGE_PATH,
       template: {
         backgroundColor: "#4F46E5",
